@@ -27,7 +27,7 @@ The offline demo mode does not require API keys.
 From the repository root:
 
 ```bash
-cd evidence-mad
+cd mad
 python -m venv .venv
 source .venv/bin/activate        # Windows PowerShell: .venv\\Scripts\\Activate.ps1
 python -m pip install --upgrade pip
