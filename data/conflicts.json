@@ -1,0 +1,7 @@
+[
+  {"id":"temporal_1","query":"When was the policy introduced?","expected_conflict":true,"expected_conflict_type":"temporal","expected_answer":"The sources report different years; identify the year relevant to the question."},
+  {"id":"factual_1","query":"What is the speed of light?","expected_conflict":false,"expected_conflict_type":null,"expected_answer":"The speed of light in vacuum is approximately 299792458 meters per second."},
+  {"id":"version_1","query":"What changed between version 1.0 and version 2.0?","expected_conflict":true,"expected_conflict_type":"version","expected_answer":"The answer depends on the software version being discussed."},
+  {"id":"contextual_1","query":"Is coffee healthy for everyone?","expected_conflict":true,"expected_conflict_type":"contextual","expected_answer":"Effects depend on the person and amount consumed."},
+  {"id":"source_1","query":"Which source should be trusted, a blog or a peer reviewed study?","expected_conflict":true,"expected_conflict_type":"source","expected_answer":"Prefer the peer reviewed study when methods and relevance are comparable."}
+]
