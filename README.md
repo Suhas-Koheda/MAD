@@ -16,8 +16,14 @@ python api.py
 
 Demo mode is offline and intentionally contains both paths: ordinary questions
 produce agreeing evidence and skip debate; policy-introduction questions produce
-a temporal conflict and run three debate rounds. Real mode uses the configured
-OpenAI-compatible LLM endpoint, Google Custom Search, and the Hugging Face NLI model.
+a temporal conflict and run three debate rounds. Real mode uses the configured OpenAI-compatible LLM endpoint and independent,
+keyless search providers. Agent A uses DuckDuckGo HTML search, Agent B uses the
+Wikipedia public API, and Agent C uses Crossref scholarly metadata. Crossref and
+Wikipedia have DuckDuckGo fallbacks so the prototype can continue when a free
+endpoint rate-limits or is unavailable. Google Custom Search remains an optional
+provider when `SEARCH_API_KEY` and `SEARCH_ENGINE_ID` are configured. The NLI
+model is configurable; use `NLI_MODE=mock` for a fast local run or
+`NLI_MODE=transformers` for the Hugging Face model.
 
 ## Architecture
 
@@ -34,6 +40,28 @@ flowchart TD
 Conflict strategies are factual, temporal, version, contextual, and source-specific.
 Each execution is saved as a JSON trace under `results/`, including evidence,
 claim-pair scores, gate decision, strategy, rounds, latency, and call count.
+
+## Independent search agents
+
+The agents intentionally do not all send the same request to the same search
+engine:
+
+| Agent | Provider | Query focus |
+|---|---|---|
+| `search_agent_a` | DuckDuckGo HTML | General web sources |
+| `search_agent_b` | Wikipedia public API, then DuckDuckGo fallback | Reference and primary-background sources |
+| `search_agent_c` | Crossref scholarly API, then DuckDuckGo academic fallback | Academic and historical sources |
+
+The provider and query suffix are preserved in each evidence record metadata,
+so an experiment can inspect how the evidence was obtained. No search API key is
+required for the default providers. These sources can still overlap when they
+index the same fact, but the retrieval paths and returned URLs are independent.
+
+To test the providers directly:
+
+```bash
+python -c "import asyncio; from agents.search_agent import SearchAgentA, SearchAgentB, SearchAgentC; agents=[SearchAgentA(False), SearchAgentB(False), SearchAgentC(False)]; print([(a.agent_id, a.config.provider) for a in agents]); asyncio.run(asyncio.gather(*(a.close() for a in agents)))"
+```
 
 ## Evaluation
 

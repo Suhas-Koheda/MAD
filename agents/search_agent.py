@@ -24,6 +24,7 @@ class SearchAgentConfig(AgentConfig):
     language: str = "en"
     safe_search: bool = True
     query_suffix: str = ""
+    provider: str = "duckduckgo"  # duckduckgo, wikipedia, google
 
 
 class SearchAgent(BaseAgent):
@@ -91,12 +92,13 @@ class SearchAgent(BaseAgent):
                 "snippet": "Python is a programming language used for programming and web development.",
                 "link": f"https://example.com/{self.agent_id}/python",
             }]
-        
-        # Try Google Custom Search API
-        if settings.search_api_key and settings.search_engine_id:
+        if self.config.provider == "wikipedia":
+            return await self._wikipedia_search(effective_query)
+        if self.config.provider == "crossref":
+            return await self._crossref_search(effective_query)
+        if self.config.provider == "google" and settings.search_api_key and settings.search_engine_id:
             return await self._google_search(effective_query)
-        
-        if not self.demo_mode:
+        if self.config.provider == "duckduckgo":
             return await self._duckduckgo_search(effective_query)
         # Fallback to simple search (could be extended)
         self.logger.warning("No search API configured, using demo data")
@@ -108,7 +110,48 @@ class SearchAgent(BaseAgent):
         response.raise_for_status()
         matches = re.findall(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>', response.text, re.I | re.S)
         snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', response.text, re.I | re.S)
-        return [{"title": re.sub(r"<[^>]+>", "", html.unescape(title)).strip(), "snippet": re.sub(r"<[^>]+>", "", html.unescape(snippets[i] if i < len(snippets) else title)).strip(), "link": html.unescape(link)} for link, title in matches[:self.config.max_results]]
+        return [{"title": re.sub(r"<[^>]+>", "", html.unescape(title)).strip(), "snippet": re.sub(r"<[^>]+>", "", html.unescape(snippets[i] if i < len(snippets) else title)).strip(), "link": html.unescape(link)} for i, (link, title) in enumerate(matches[:self.config.max_results])]
+    async def _wikipedia_search(self, query: str) -> List[Dict[str, Any]]:
+        """Search Wikipedia using its free public API; no API key required."""
+        try:
+            response = await self.client.get("https://en.wikipedia.org/w/api.php", params={"action": "query", "list": "search", "srsearch": query, "format": "json", "utf8": 1, "srlimit": self.config.max_results}, headers={"User-Agent": "EvidenceMAD/1.0 research contact@example.com"})
+            response.raise_for_status()
+            items = response.json().get("query", {}).get("search", [])
+            return [{"title": item.get("title", ""), "snippet": re.sub(r"<[^>]+>", "", html.unescape(item.get("snippet", ""))).strip(), "link": "https://en.wikipedia.org/?curid=" + str(item.get("pageid", ""))} for item in items]
+        except Exception as exc:
+            self.logger.warning(f"Wikipedia search unavailable: {exc}; using DuckDuckGo fallback")
+            return await self._duckduckgo_search(f"{query} site:wikipedia.org")
+
+    async def _crossref_search(self, query: str) -> List[Dict[str, Any]]:
+        """Search Crossref's free scholarly metadata API."""
+        try:
+            response = await self.client.get(
+                "https://api.crossref.org/works",
+                params={
+                    "query.bibliographic": query,
+                    "rows": self.config.max_results,
+                    "select": "title,URL,container-title,published",
+                },
+                headers={"User-Agent": "EvidenceMAD/1.0 (mailto:research@example.com)"},
+            )
+            response.raise_for_status()
+            items = response.json().get("message", {}).get("items", [])
+            results = []
+            for item in items:
+                title = (item.get("title") or ["Untitled"])[0]
+                venue = (item.get("container-title") or [""])[0]
+                published = item.get("published", {}).get("date-parts", [[""]])[0]
+                year = published[0] if published else ""
+                results.append({
+                    "title": title,
+                    "snippet": f"Scholarly work indexed by Crossref{f' · {venue}' if venue else ''}{f' · {year}' if year else ''}",
+                    "link": item.get("URL", ""),
+                })
+            return results
+        except Exception as exc:
+            self.logger.warning(f"Crossref search unavailable: {exc}; using DuckDuckGo fallback")
+            return await self._duckduckgo_search(f"{query} academic research")
+
 
     async def _google_search(self, query: str) -> List[Dict[str, Any]]:
         """Perform Google Custom Search."""
@@ -185,6 +228,8 @@ class SearchAgent(BaseAgent):
             metadata={
                 "search_results_count": len(search_results),
                 "search_engine": self.config.search_engine,
+                "provider": self.config.provider,
+                "query_suffix": self.config.query_suffix,
             },
         )
     
@@ -203,6 +248,7 @@ class SearchAgentA(SearchAgent):
             description="Primary web search agent",
             max_results=5,
             query_suffix="general web sources",
+            provider="duckduckgo",
         )
         super().__init__(config, demo_mode=demo_mode)
 
@@ -217,6 +263,7 @@ class SearchAgentB(SearchAgent):
             description="Secondary web search agent with different parameters",
             max_results=5,
             query_suffix="official government and primary sources",
+            provider="wikipedia",
         )
         super().__init__(config, demo_mode=demo_mode)
 
@@ -231,4 +278,6 @@ class SearchAgentC(SearchAgent):
             description="Tertiary web search agent",
             max_results=5,
             query_suffix="academic historical timeline sources",
+            provider="crossref",
         )
+        super().__init__(config, demo_mode=demo_mode)
