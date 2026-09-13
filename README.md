@@ -60,7 +60,21 @@ index the same fact, but the retrieval paths and returned URLs are independent.
 To test the providers directly:
 
 ```bash
-python -c "import asyncio; from agents.search_agent import SearchAgentA, SearchAgentB, SearchAgentC; agents=[SearchAgentA(False), SearchAgentB(False), SearchAgentC(False)]; print([(a.agent_id, a.config.provider) for a in agents]); asyncio.run(asyncio.gather(*(a.close() for a in agents)))"
+python - <<'PY'
+import asyncio
+from agents.search_agent import SearchAgentA, SearchAgentB, SearchAgentC
+
+async def main():
+    agents = [SearchAgentA(demo_mode=False), SearchAgentB(demo_mode=False), SearchAgentC(demo_mode=False)]
+    try:
+        for agent in agents:
+            results = await agent.search("India National Education Policy introduced")
+            print(agent.agent_id, agent.config.provider, results[0]["title"] if results else "NO RESULTS")
+    finally:
+        await asyncio.gather(*(agent.close() for agent in agents))
+
+asyncio.run(main())
+PY
 ```
 
 ## Evaluation
