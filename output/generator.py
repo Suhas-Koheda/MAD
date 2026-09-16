@@ -1,243 +1,268 @@
 """
-Final answer generator for producing structured responses.
+Final answer generator (Task 21).
+Drives output from EvidenceState — four distinct shapes, no bullet dumps.
+Reports independent_agents_agreeing separately from source_count.
 """
-from typing import List, Dict, Any, Optional
+from typing import List, Optional
 from loguru import logger
 
 from evidence.models import (
-    Evidence, Conflict, ConflictType, DebateRound, 
-    JudgeResult, FinalAnswer, Source
+    AgentEvidence, EvidenceState, EvidenceDecision,
+    Conflict, DebateOutcome, JudgeResult, FinalAnswer, Source,
 )
+from llm_client import LLMClient, LLMError
 from config import settings
 
 
 class AnswerGenerator:
-    """
-    Generates final answers from debate outcomes or direct evidence.
-    """
-    
-    def __init__(self, llm_client=None):
+    """Generates final answers driven by EvidenceState."""
+
+    def __init__(self, llm_client: Optional[LLMClient] = None):
         self.llm_client = llm_client
-        self.demo_mode = settings.demo_mode
-    
+
     def generate(
         self,
         query: str,
-        evidence_a: Evidence,
-        evidence_b: Evidence,
-        debate_triggered: bool = False,
+        decision: EvidenceDecision,
+        agent_evidence: List[AgentEvidence],
         conflict: Optional[Conflict] = None,
-        debate_rounds: Optional[List[DebateRound]] = None,
+        debate_outcome: Optional[DebateOutcome] = None,
         judge_result: Optional[JudgeResult] = None,
     ) -> FinalAnswer:
         """
-        Generate the final answer.
-        
-        Args:
-            query: Original user query
-            evidence_a: Evidence from agent A
-            evidence_b: Evidence from agent B
-            debate_triggered: Whether debate was triggered
-            conflict: The detected conflict (if any)
-            debate_rounds: List of debate rounds (if debate occurred)
-            judge_result: Judge's evaluation (if debate occurred)
-            
-        Returns:
-            FinalAnswer with complete response
+        Generate the final answer driven by decision.state.
+
+        AGREEMENT    → single LLM call producing a direct answer
+        DISAGREEMENT → conflict type + judge resolution (or "debate did not complete")
+        UNCERTAIN    → "evidence neither clearly agreed nor conflicted"
+        INSUFFICIENT → explicit statement naming failed agents; no answer content
         """
-        if debate_triggered and judge_result:
-            return self._generate_from_debate(
-                query, evidence_a, evidence_b, conflict,
-                debate_rounds, judge_result
+        state = decision.state
+
+        if state == EvidenceState.AGREEMENT:
+            return self._generate_agreement(query, decision, agent_evidence)
+
+        if state == EvidenceState.DISAGREEMENT:
+            return self._generate_disagreement(
+                query, decision, agent_evidence, conflict, debate_outcome, judge_result
             )
-        else:
-            return self._generate_direct(
-                query, evidence_a, evidence_b
-            )
-    
-    def _generate_direct(
+
+        if state == EvidenceState.UNCERTAIN:
+            return self._generate_uncertain(query, decision, agent_evidence)
+
+        # INSUFFICIENT
+        return self._generate_insufficient(query, decision)
+
+    # ------------------------------------------------------------------ #
+    # AGREEMENT                                                            #
+    # ------------------------------------------------------------------ #
+
+    def _generate_agreement(
         self,
         query: str,
-        evidence_a: Evidence,
-        evidence_b: Evidence,
+        decision: EvidenceDecision,
+        agent_evidence: List[AgentEvidence],
     ) -> FinalAnswer:
-        """Generate answer directly when evidence agrees."""
-        # Combine evidence from both agents
-        all_claims = evidence_a.claims + evidence_b.claims
-        all_sources = evidence_a.sources + evidence_b.sources
-        
-        # Create unified answer
-        answer_parts = []
-        answer_parts.append(f"Based on evidence from {len(all_sources)} sources:")
-        answer_parts.append("")
-        
-        # Add claims from both agents
-        if evidence_a.claims:
-            answer_parts.append(f"From {evidence_a.agent_id}:")
-            for claim in evidence_a.claims[:3]:
-                answer_parts.append(f"  • {claim.text}")
-            answer_parts.append("")
-        
-        if evidence_b.claims:
-            answer_parts.append(f"From {evidence_b.agent_id}:")
-            for claim in evidence_b.claims[:3]:
-                answer_parts.append(f"  • {claim.text}")
-            answer_parts.append("")
-        
-        answer = "\n".join(answer_parts)
-        
-        # Create reasoning
-        reasoning = (
-            f"Evidence from both agents ({evidence_a.agent_id} and {evidence_b.agent_id}) "
-            f"was consistent. No significant disagreement was detected. "
-            f"The answer combines corroborating evidence from {len(all_sources)} sources."
-        )
-        
-        # Deduplicate sources
+        usable = [e for e in agent_evidence if e.is_usable]
+        all_sources = [s for e in usable for s in e.sources]
         unique_sources = self._deduplicate_sources(all_sources)
-        
+
+        # Build context for LLM
+        claims_text = "\n".join(
+            f"- [{e.agent_id}] {e.claims[0].text}" for e in usable if e.claims
+        )
+
+        if self.llm_client:
+            prompt = (
+                f"Query: {query}\n\n"
+                f"Multiple independent sources agree on the following:\n{claims_text}\n\n"
+                f"Write a concise, direct answer to the query using the agreed evidence. "
+                f"Do NOT list bullet points or repeat raw snippets. Write 1-3 sentences."
+            )
+            try:
+                answer_text = self.llm_client.chat(prompt, role="answer")
+            except LLMError as e:
+                logger.warning(f"LLM answer generation failed: {e}; using agreed claim directly")
+                answer_text = usable[0].claims[0].text if usable and usable[0].claims else "No answer."
+        else:
+            answer_text = usable[0].claims[0].text if usable and usable[0].claims else "No answer."
+
+        reasoning = (
+            f"{len(usable)} independent agent(s) retrieved consistent evidence. "
+            f"{decision.rationale}"
+        )
+
         return FinalAnswer(
             query=query,
-            answer=answer,
+            answer=answer_text,
             reasoning=reasoning,
-            evidence=[evidence_a, evidence_b],
+            evidence_state=EvidenceState.AGREEMENT,
             sources=unique_sources,
             debate_triggered=False,
-            conflict=None,
-            debate_rounds=[],
-            judge_result=None,
-            metadata={
-                "evidence_agreement": True,
-                "total_claims": len(all_claims),
-                "total_sources": len(unique_sources),
-            },
+            independent_agents_agreeing=len(usable),
+            source_count=len(unique_sources),
+            metadata={"evidence_state": "agreement"},
         )
-    
-    def _generate_from_debate(
+
+    # ------------------------------------------------------------------ #
+    # DISAGREEMENT                                                         #
+    # ------------------------------------------------------------------ #
+
+    def _generate_disagreement(
         self,
         query: str,
-        evidence_a: Evidence,
-        evidence_b: Evidence,
+        decision: EvidenceDecision,
+        agent_evidence: List[AgentEvidence],
         conflict: Optional[Conflict],
-        debate_rounds: Optional[List[DebateRound]],
-        judge_result: JudgeResult,
+        debate_outcome: Optional[DebateOutcome],
+        judge_result: Optional[JudgeResult],
     ) -> FinalAnswer:
-        """Generate answer from debate outcome."""
-        # Select winning evidence based on judge
-        if judge_result.winner == "candidate_1":
-            winning_evidence = evidence_a
-            losing_evidence = evidence_b
-        else:
-            winning_evidence = evidence_b
-            losing_evidence = evidence_a
-        
-        # Build answer
-        answer_parts = []
-        answer_parts.append(f"Answer (resolved through evidence-based debate):")
-        answer_parts.append("")
-        
-        # Get winner's answer
-        if judge_result.winner == "candidate_1":
-            answer_parts.append(evidence_a.answer)
-        else:
-            answer_parts.append(evidence_b.answer)
-        
-        answer_parts.append("")
-        
-        # Add conflict resolution
-        if conflict:
-            answer_parts.append(f"Conflict Detected: {conflict.type.value.upper()}")
-            answer_parts.append(f"Resolution: {conflict.explanation}")
-            answer_parts.append("")
-        
-        # Add judge's reasoning
-        answer_parts.append(f"Judge's Reasoning: {judge_result.reason}")
-        
-        answer = "\n".join(answer_parts)
-        
-        # Create reasoning
-        reasoning = (
-            f"A {conflict.type.value if conflict else 'unknown'} conflict was detected "
-            f"between evidence from {evidence_a.agent_id} and {evidence_b.agent_id}. "
-            f"After {len(debate_rounds) if debate_rounds else 0} rounds of structured debate, "
-            f"the judge selected {judge_result.winner} with "
-            f"{judge_result.confidence:.0%} confidence."
-        )
-        
-        # Collect all sources
-        all_sources = evidence_a.sources + evidence_b.sources
+        usable = [e for e in agent_evidence if e.is_usable]
+        all_sources = [s for e in usable for s in e.sources]
         unique_sources = self._deduplicate_sources(all_sources)
-        
+
+        if judge_result is None or (debate_outcome and debate_outcome.status != "completed"):
+            # Debate did not complete — never claim resolution
+            conflict_desc = f" ({conflict.type.value})" if conflict else ""
+            answer_text = (
+                f"A conflict{conflict_desc} was detected between sources, but the structured debate "
+                f"did not complete successfully"
+            )
+            if debate_outcome and debate_outcome.failed_stages:
+                answer_text += f" (failed at: {', '.join(debate_outcome.failed_stages)})"
+            answer_text += ". The conflict remains unresolved. Please consult the sources directly."
+
+            return FinalAnswer(
+                query=query,
+                answer=answer_text,
+                reasoning=decision.rationale,
+                evidence_state=EvidenceState.DISAGREEMENT,
+                sources=unique_sources,
+                debate_triggered=True,
+                conflict=conflict,
+                debate_outcome=debate_outcome,
+                judge_result=None,
+                independent_agents_agreeing=0,
+                source_count=len(unique_sources),
+                metadata={
+                    "evidence_state": "disagreement",
+                    "debate_completed": False,
+                },
+            )
+
+        # Debate completed with a judge verdict
+        conflict_type_str = conflict.type.value.upper() if conflict else "UNKNOWN"
+        winning_claim = (
+            conflict.claim_a if judge_result.winner == "candidate_1" else conflict.claim_b
+        )
+        answer_text = (
+            f"A {conflict_type_str} conflict was detected and resolved through structured debate.\n\n"
+            f"Resolution: {winning_claim.text}\n\n"
+            f"Judge's reasoning: {judge_result.reason}"
+        )
+
         return FinalAnswer(
             query=query,
-            answer=answer,
-            reasoning=reasoning,
-            evidence=[evidence_a, evidence_b],
+            answer=answer_text,
+            reasoning=decision.rationale,
+            evidence_state=EvidenceState.DISAGREEMENT,
             sources=unique_sources,
             debate_triggered=True,
             conflict=conflict,
-            debate_rounds=debate_rounds or [],
+            debate_outcome=debate_outcome,
             judge_result=judge_result,
+            independent_agents_agreeing=0,
+            source_count=len(unique_sources),
             metadata={
-                "evidence_agreement": False,
-                "debate_rounds": len(debate_rounds) if debate_rounds else 0,
+                "evidence_state": "disagreement",
+                "conflict_type": conflict.type.value if conflict else "unknown",
+                "debate_completed": True,
                 "winner": judge_result.winner,
                 "confidence": judge_result.confidence,
-                "conflict_type": conflict.type.value if conflict else "unknown",
             },
         )
-    
+
+    # ------------------------------------------------------------------ #
+    # UNCERTAIN                                                            #
+    # ------------------------------------------------------------------ #
+
+    def _generate_uncertain(
+        self,
+        query: str,
+        decision: EvidenceDecision,
+        agent_evidence: List[AgentEvidence],
+    ) -> FinalAnswer:
+        usable = [e for e in agent_evidence if e.is_usable]
+        all_sources = [s for e in usable for s in e.sources]
+        unique_sources = self._deduplicate_sources(all_sources)
+
+        findings = "\n".join(
+            f"- [{e.agent_id}]: {e.claims[0].text}" for e in usable if e.claims
+        )
+        answer_text = (
+            f"Evidence neither clearly agreed nor conflicted for this query. "
+            f"Different sources found:\n{findings}\n\n"
+            f"No single authoritative answer could be determined. "
+            f"Consider consulting the sources directly."
+        )
+
+        return FinalAnswer(
+            query=query,
+            answer=answer_text,
+            reasoning=decision.rationale,
+            evidence_state=EvidenceState.UNCERTAIN,
+            sources=unique_sources,
+            debate_triggered=False,
+            independent_agents_agreeing=0,
+            source_count=len(unique_sources),
+            metadata={"evidence_state": "uncertain"},
+        )
+
+    # ------------------------------------------------------------------ #
+    # INSUFFICIENT                                                         #
+    # ------------------------------------------------------------------ #
+
+    def _generate_insufficient(
+        self,
+        query: str,
+        decision: EvidenceDecision,
+    ) -> FinalAnswer:
+        failed_info = "; ".join(
+            f"{f['agent_id']} ({f['reason']})" for f in decision.failed_agents
+        )
+        answer_text = (
+            f"Insufficient evidence was retrieved to answer this query. "
+            f"Failed agents: {failed_info if failed_info else 'all agents returned no usable results'}."
+        )
+
+        return FinalAnswer(
+            query=query,
+            answer=answer_text,
+            reasoning=decision.rationale,
+            evidence_state=EvidenceState.INSUFFICIENT,
+            sources=[],
+            debate_triggered=False,
+            independent_agents_agreeing=0,
+            source_count=0,
+            metadata={
+                "evidence_state": "insufficient",
+                "failed_agents": decision.failed_agents,
+            },
+        )
+
+    # ------------------------------------------------------------------ #
+    # Helpers                                                              #
+    # ------------------------------------------------------------------ #
+
     def _deduplicate_sources(self, sources: List[Source]) -> List[Source]:
         """Remove duplicate sources by URL."""
-        seen_urls = set()
+        seen: set = set()
         unique = []
-        for source in sources:
-            if source.url not in seen_urls:
-                seen_urls.add(source.url)
-                unique.append(source)
+        for s in sources:
+            if s.url not in seen:
+                seen.add(s.url)
+                unique.append(s)
         return unique
-    
-    def format_for_display(self, answer: FinalAnswer) -> str:
-        """Format answer for human-readable display."""
-        lines = []
-        lines.append("=" * 60)
-        lines.append("MULTI-AGENT DEBATE SYSTEM - ANSWER")
-        lines.append("=" * 60)
-        lines.append("")
-        lines.append(f"Query: {answer.query}")
-        lines.append("")
-        
-        if answer.debate_triggered:
-            lines.append(f"Debate: YES ({len(answer.debate_rounds)} rounds)")
-            if answer.conflict:
-                lines.append(f"Conflict Type: {answer.conflict.type.value}")
-        else:
-            lines.append("Debate: NO (evidence agreed)")
-        
-        lines.append("")
-        lines.append("-" * 60)
-        lines.append(answer.answer)
-        lines.append("-" * 60)
-        lines.append("")
-        
-        if answer.reasoning:
-            lines.append(f"Reasoning: {answer.reasoning}")
-            lines.append("")
-        
-        if answer.sources:
-            lines.append("Sources:")
-            for i, source in enumerate(answer.sources, 1):
-                lines.append(f"  {i}. {source.title}")
-                lines.append(f"     {source.url}")
-            lines.append("")
-        
-        if answer.judge_result:
-            lines.append("Judge Evaluation:")
-            lines.append(f"  Winner: {answer.judge_result.winner}")
-            lines.append(f"  Confidence: {answer.judge_result.confidence:.0%}")
-            lines.append(f"  Evidence Score: {answer.judge_result.evidence_score:.0%}")
-        
-        return "\n".join(lines)
 
 
 def get_answer_generator(llm_client=None) -> AnswerGenerator:

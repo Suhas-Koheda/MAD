@@ -1,8 +1,13 @@
 """
 Experiment runner for evaluating the Multi-Agent Debate system.
-Runs all three systems: Single LLM, Standard MAD, and Proposed MAD.
+
+Tasks applied:
+  Task 25: Uses SingleLLMSystem / StandardMADSystem / ProposedMADSystem —
+           no async, no post-hoc label editing, no mock conflict fabrication.
+  Task 26: All 5-6 systems (+ ablations) run from one command.
+  Task 28: generate_graphs uses only measured trace data —
+           zero hardcoded bar values anywhere.
 """
-import asyncio
 import json
 import time
 from pathlib import Path
@@ -12,359 +17,313 @@ from loguru import logger
 from evidence.models import ExecutionTrace
 from evaluation.dataset import EvaluationDataset, EvaluationSample, get_evaluation_dataset
 from evaluation.metrics import MetricsCalculator, get_metrics_calculator
-from app import MADSystem, save_trace
+from evaluation.systems.single_llm import SingleLLMSystem
+from evaluation.systems.standard_mad import StandardMADSystem
+from evaluation.systems.proposed_mad import (
+    ProposedMADSystem,
+    NoGateSystem,
+    NoTypedStrategySystem,
+    NoRelevanceFilterSystem,
+)
+from app import save_trace
+from run_mode import RunMode
 from config import settings
 
 
+# ------------------------------------------------------------------ #
+# Per-system runner helper                                             #
+# ------------------------------------------------------------------ #
+
+def _run_system(
+    system,
+    samples: List[EvaluationSample],
+    results_dir: Path,
+) -> List[ExecutionTrace]:
+    """
+    Run a single system over all samples and save per-sample traces.
+
+    Args:
+        system:      Any object with .run(query) -> ExecutionTrace and .SYSTEM_NAME
+        samples:     EvaluationSample list
+        results_dir: Root results directory; traces go into results_dir/system_name/
+
+    Returns:
+        List of ExecutionTrace (one per sample, including errors)
+    """
+    system_name = system.SYSTEM_NAME
+    system_dir = results_dir / system_name
+    system_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info(f"Running system: {system_name} ({len(samples)} samples)")
+    traces: List[ExecutionTrace] = []
+
+    for i, sample in enumerate(samples, 1):
+        logger.debug(f"  [{i}/{len(samples)}] {system_name}: {sample.query[:60]!r}")
+        try:
+            trace = system.run(sample.query)
+        except Exception as exc:
+            logger.error(f"  {system_name} raised for sample {sample.id!r}: {exc}")
+            trace = ExecutionTrace(query=sample.query, error=str(exc))
+
+        # Attach evaluation metadata so MetricsCalculator can score it
+        if trace.router_result is None:
+            trace.router_result = {}
+        trace.router_result.update({
+            "expected_conflict": sample.expected_conflict,
+            "expected_conflict_type": sample.expected_conflict_type,
+            "expected_answer": sample.expected_answer or "",
+            "required_facts": sample.required_facts,
+            "forbidden_facts": sample.forbidden_facts,
+        })
+        if "system" not in trace.metrics:
+            trace.metrics["system"] = system_name
+
+        save_trace(trace, str(system_dir))
+        traces.append(trace)
+
+    logger.info(f"  {system_name}: {len(traces)} traces written to {system_dir}")
+    return traces
+
+
+# ------------------------------------------------------------------ #
+# Main experiment runner                                               #
+# ------------------------------------------------------------------ #
+
 class ExperimentRunner:
     """
-    Runs experiments comparing Single LLM, Standard MAD, and Proposed MAD.
+    Runs all systems over the evaluation dataset.
+    Pure synchronous — no asyncio.run anywhere.
     """
-    
-    def __init__(self, demo_mode: bool = False):
-        self.demo_mode = demo_mode
+
+    def __init__(self, run_mode: RunMode = RunMode.LIVE):
+        self.run_mode = run_mode
         self.dataset = get_evaluation_dataset()
         self.results_dir = Path("results")
         self.results_dir.mkdir(exist_ok=True)
-    
-    async def run_single_llm_baseline(
-        self,
-        samples: Optional[List[EvaluationSample]] = None,
-    ) -> List[ExecutionTrace]:
-        """
-        Run Single LLM baseline: Query → LLM → Answer.
-        
-        Args:
-            samples: Evaluation samples (uses full dataset if None)
-            
-        Returns:
-            List of execution traces
-        """
-        logger.info("Running Single LLM baseline")
-        samples = samples or self.dataset.samples
-        traces = []
-        
-        for sample in samples:
-            trace = ExecutionTrace(
-                query=sample.query,
-                router_result={
-                    "expected_conflict": sample.expected_conflict,
-                    "expected_conflict_type": sample.expected_conflict_type,
-                },
-            )
-            
-            start_time = time.time()
-            
-            try:
-                # Simple single-agent answer (no debate)
-                system = MADSystem(demo_mode=self.demo_mode)
-                result = await system.solve(sample.query)
-                result.router_result.update({"expected_conflict": sample.expected_conflict, "expected_conflict_type": sample.expected_conflict_type, "expected_answer": sample.expected_answer})
-                
-                # Override to ensure no debate
-                result.debate_triggered = False
-                result.conflict = None
-                result.debate_rounds = []
-                result.judge_result = None
-                
-                # Keep original metrics
-                result.metrics["debate_triggered"] = False
-                result.metrics["system"] = "single_llm"
-                
-                traces.append(result)
-                
-            except Exception as e:
-                logger.error(f"Single LLM failed for '{sample.query}': {e}")
-                trace.error = str(e)
-                traces.append(trace)
-        
-        logger.info(f"Single LLM baseline completed: {len(traces)} samples")
-        return traces
-    
-    async def run_standard_mad_baseline(
-        self,
-        samples: Optional[List[EvaluationSample]] = None,
-    ) -> List[ExecutionTrace]:
-        """
-        Run Standard MAD baseline: Always debate regardless of evidence.
-        
-        Args:
-            samples: Evaluation samples (uses full dataset if None)
-            
-        Returns:
-            List of execution traces
-        """
-        logger.info("Running Standard MAD baseline")
-        samples = samples or self.dataset.samples
-        traces = []
-        
-        for sample in samples:
-            trace = ExecutionTrace(
-                query=sample.query,
-                router_result={
-                    "expected_conflict": sample.expected_conflict,
-                    "expected_conflict_type": sample.expected_conflict_type,
-                },
-            )
-            
-            try:
-                # Use proposed system but force debate
-                system = MADSystem(demo_mode=self.demo_mode)
-                result = await system.solve(sample.query)
-                result.router_result.update({"expected_conflict": sample.expected_conflict, "expected_conflict_type": sample.expected_conflict_type, "expected_answer": sample.expected_answer})
-                
-                # Override: force debate for standard MAD
-                result.debate_triggered = True
-                
-                # If no conflict was detected, create a mock one
-                if not result.conflict:
-                    from evidence.models import Conflict, ConflictType, Claim, Source
-                    mock_conflict = Conflict(
-                        type=ConflictType.FACTUAL,
-                        confidence=0.8,
-                        explanation="Standard MAD always debates",
-                        claim_a=Claim(text="Mock claim A", source=Source(url="", title="", snippet="")),
-                        claim_b=Claim(text="Mock claim B", source=Source(url="", title="", snippet="")),
-                    )
-                    result.conflict = mock_conflict
-                
-                # Ensure metrics reflect standard MAD
-                result.metrics["debate_triggered"] = True
-                result.router_result["expected_answer"] = sample.expected_answer
-                result.metrics["system"] = "standard_mad"
-                
-                traces.append(result)
-                
-            except Exception as e:
-                logger.error(f"Standard MAD failed for '{sample.query}': {e}")
-                trace.error = str(e)
-                traces.append(trace)
-        
-        logger.info(f"Standard MAD baseline completed: {len(traces)} samples")
-        return traces
-    
-    async def run_proposed_mad(
-        self,
-        samples: Optional[List[EvaluationSample]] = None,
-    ) -> List[ExecutionTrace]:
-        """
-        Run Proposed MAD: Evidence-triggered debate with conflict classification.
-        
-        Args:
-            samples: Evaluation samples (uses full dataset if None)
-            
-        Returns:
-            List of execution traces
-        """
-        logger.info("Running Proposed MAD")
-        samples = samples or self.dataset.samples
-        traces = []
-        
-        for sample in samples:
-            try:
-                system = MADSystem(demo_mode=self.demo_mode)
-                result = await system.solve(sample.query)
-                result.router_result.update({"expected_conflict": sample.expected_conflict, "expected_conflict_type": sample.expected_conflict_type, "expected_answer": sample.expected_answer})
-                
-                # Add expected values for evaluation
-                result.router_result["expected_conflict"] = sample.expected_conflict
-                result.router_result["expected_conflict_type"] = sample.expected_conflict_type
-                
-                result.router_result["expected_answer"] = sample.expected_answer
-                result.metrics["system"] = "proposed_mad"
-                traces.append(result)
-                
-            except Exception as e:
-                logger.error(f"Proposed MAD failed for '{sample.query}': {e}")
-                trace = ExecutionTrace(
-                    query=sample.query,
-                    error=str(e),
-                    router_result={
-                        "expected_conflict": sample.expected_conflict,
-                        "expected_conflict_type": sample.expected_conflict_type,
-                    },
-                )
-                traces.append(trace)
-        
-        logger.info(f"Proposed MAD completed: {len(traces)} samples")
-        return traces
-    
-    async def run_all_experiments(
+
+    def run_all_experiments(
         self,
         samples: Optional[List[EvaluationSample]] = None,
     ) -> Dict[str, Any]:
         """
-        Run all experiments and return comparison results.
-        
-        Args:
-            samples: Evaluation samples (uses full dataset if None)
-            
+        Run all 6 systems over the dataset and save results.
+
         Returns:
-            Dictionary with results for all systems
+            Dictionary with per-system metrics.
         """
-        logger.info("Starting full experiment suite")
         samples = samples or self.dataset.samples
-        
-        # Run all three systems
-        single_llm_traces = await self.run_single_llm_baseline(samples)
-        standard_mad_traces = await self.run_standard_mad_baseline(samples)
-        proposed_mad_traces = await self.run_proposed_mad(samples)
-        
-        # Calculate metrics for each
-        single_llm_calc = get_metrics_calculator()
-        single_llm_calc.add_results(single_llm_traces)
-        single_llm_metrics = single_llm_calc.calculate_metrics()
-        single_llm_metrics["accuracy"] = single_llm_metrics.get("answer_accuracy", 0.0)
-        
-        standard_mad_calc = get_metrics_calculator()
-        standard_mad_calc.add_results(standard_mad_traces)
-        standard_mad_metrics = standard_mad_calc.calculate_metrics()
-        standard_mad_metrics["accuracy"] = standard_mad_metrics.get("answer_accuracy", 0.0)
-        
-        proposed_mad_calc = get_metrics_calculator()
-        proposed_mad_calc.add_results(proposed_mad_traces)
-        proposed_mad_metrics = proposed_mad_calc.calculate_metrics()
-        proposed_mad_metrics["accuracy"] = proposed_mad_metrics.get("answer_accuracy", 0.0)
-        
-        # Save traces
-        for trace in single_llm_traces:
-            save_trace(trace, str(self.results_dir / "single_llm"))
-        for trace in standard_mad_traces:
-            save_trace(trace, str(self.results_dir / "standard_mad"))
-        for trace in proposed_mad_traces:
-            save_trace(trace, str(self.results_dir / "proposed_mad"))
-        
-        # Save metrics
-        all_metrics = {
-            "single_llm": single_llm_metrics,
-            "standard_mad": standard_mad_metrics,
-            "proposed_mad": proposed_mad_metrics,
-            "dataset_statistics": self.dataset.get_statistics(),
+        logger.info(
+            f"Starting full experiment suite — {len(samples)} samples, "
+            f"mode={self.run_mode.value}"
+        )
+
+        # ── Instantiate all systems ───────────────────────────────────
+        systems = {
+            "single_llm":          SingleLLMSystem(run_mode=self.run_mode),
+            "standard_mad":        StandardMADSystem(run_mode=self.run_mode),
+            "proposed_mad":        ProposedMADSystem(run_mode=self.run_mode),
+            "no_gate":             NoGateSystem(run_mode=self.run_mode),
+            "no_typed_strategy":   NoTypedStrategySystem(run_mode=self.run_mode),
+            "no_relevance_filter": NoRelevanceFilterSystem(run_mode=self.run_mode),
         }
-        
+
+        # ── Run each system ───────────────────────────────────────────
+        all_traces: Dict[str, List[ExecutionTrace]] = {}
+        for name, system in systems.items():
+            all_traces[name] = _run_system(system, samples, self.results_dir)
+
+        # ── Calculate metrics per system ──────────────────────────────
+        all_metrics: Dict[str, Any] = {}
+        for name, traces in all_traces.items():
+            calc = get_metrics_calculator()
+            calc.add_results(traces)
+            m = calc.calculate_metrics()
+            all_metrics[name] = m
+
+            # Save per-system metrics and CSV
+            system_dir = self.results_dir / name
+            calc.save_metrics(str(system_dir / "metrics.json"))
+            calc.save_results_csv(str(system_dir / "results.csv"))
+
+        all_metrics["dataset_statistics"] = self.dataset.get_statistics()
+
+        # ── Save combined metrics ─────────────────────────────────────
         metrics_path = self.results_dir / "experiment_metrics.json"
         with open(metrics_path, "w") as f:
             json.dump(all_metrics, f, indent=2, default=str)
-        
-        # Print comparison table
-        table = single_llm_calc.print_comparison_table(
-            single_llm_metrics, standard_mad_metrics, proposed_mad_metrics
+        logger.info(f"Combined metrics saved to {metrics_path}")
+
+        # ── Print comparison table ────────────────────────────────────
+        calc_single = get_metrics_calculator()
+        calc_single.add_results(all_traces["single_llm"])
+        calc_std = get_metrics_calculator()
+        calc_std.add_results(all_traces["standard_mad"])
+        calc_prop = get_metrics_calculator()
+        calc_prop.add_results(all_traces["proposed_mad"])
+
+        table = calc_prop.print_comparison_table(
+            calc_single.calculate_metrics(),
+            calc_std.calculate_metrics(),
+            calc_prop.calculate_metrics(),
         )
         print(table)
-        
-        # Generate graphs
+
+        # ── Generate figures ──────────────────────────────────────────
         self.generate_graphs(all_metrics)
-        
-        logger.info("All experiments completed")
+
+        logger.info("All experiments completed.")
         return all_metrics
-    
+
+    # ------------------------------------------------------------------ #
+    # Task 28 — honest graphs: zero hardcoded values                      #
+    # ------------------------------------------------------------------ #
+
     def generate_graphs(self, metrics: Dict[str, Any]) -> None:
-        """Generate evaluation graphs."""
+        """
+        Generate evaluation graphs.
+
+        Every bar and data point comes from measured trace data.
+        No hardcoded literals (0, 100, 1, 5, 10 ...) anywhere.
+        If a metric is missing the bar is simply absent.
+        """
         try:
+            import matplotlib
+            matplotlib.use("Agg")          # headless — no display needed
             import matplotlib.pyplot as plt
             import numpy as np
-            
-            figures_dir = self.results_dir / "figures"
-            figures_dir.mkdir(exist_ok=True)
-            
-            # Graph 1: Accuracy comparison
-            fig, ax = plt.subplots(figsize=(10, 6))
-            systems = ["Single LLM", "Standard MAD", "Proposed MAD"]
-            accuracies = [
-                metrics["single_llm"].get("accuracy", 0) * 100,
-                metrics["standard_mad"].get("accuracy", 0) * 100,
-                metrics["proposed_mad"].get("accuracy", 0) * 100,
-            ]
-            
-            colors = ['#3498db', '#e74c3c', '#2ecc71']
-            bars = ax.bar(systems, accuracies, color=colors)
-            ax.set_ylabel("Accuracy (%)")
-            ax.set_title("System Accuracy Comparison")
-            ax.set_ylim(0, 100)
-            
-            for bar, acc in zip(bars, accuracies):
-                ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1,
-                       f'{acc:.1f}%', ha='center', va='bottom')
-            
+        except ImportError as e:
+            logger.warning(f"Cannot generate graphs (missing dependency): {e}")
+            return
+
+        figures_dir = self.results_dir / "figures"
+        figures_dir.mkdir(exist_ok=True)
+
+        # Canonical system display order
+        system_display = {
+            "single_llm":          "Single LLM",
+            "standard_mad":        "Standard MAD",
+            "proposed_mad":        "Proposed MAD",
+            "no_gate":             "No Gate",
+            "no_typed_strategy":   "No Typed Strategy",
+            "no_relevance_filter": "No Relevance Filter",
+        }
+        # Only include systems that have measured data
+        present = [k for k in system_display if k in metrics and isinstance(metrics[k], dict)]
+
+        colors = plt.cm.tab10(np.linspace(0, 0.8, len(present)))
+
+        def _bar_chart(metric_key: str, ylabel: str, title: str, filename: str,
+                       scale: float = 1.0, ylim_top: Optional[float] = None) -> None:
+            """Generic helper: build a bar chart from measured metric values only."""
+            names, values = [], []
+            for k in present:
+                v = metrics[k].get(metric_key)
+                if v is not None:
+                    names.append(system_display[k])
+                    values.append(float(v) * scale)
+
+            if not values:
+                logger.warning(f"No data for {metric_key}; skipping figure {filename}")
+                return
+
+            fig, ax = plt.subplots(figsize=(max(8, len(names) * 1.5), 5))
+            bars = ax.bar(names, values, color=colors[: len(names)])
+            ax.set_ylabel(ylabel)
+            ax.set_title(title)
+            if ylim_top is not None:
+                ax.set_ylim(0, ylim_top)
+            for bar, val in zip(bars, values):
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + (ylim_top or max(values)) * 0.01,
+                    f"{val:.1f}",
+                    ha="center", va="bottom", fontsize=9,
+                )
+            plt.xticks(rotation=20, ha="right")
             plt.tight_layout()
-            plt.savefig(figures_dir / "accuracy_comparison.png", dpi=150)
+            plt.savefig(figures_dir / filename, dpi=150)
             plt.close()
-            
-            # Graph 2: LLM calls comparison
-            fig, ax = plt.subplots(figsize=(10, 6))
-            llm_calls = [
-                metrics["single_llm"].get("avg_llm_calls", 1),
-                metrics["standard_mad"].get("avg_llm_calls", 10),
-                metrics["proposed_mad"].get("avg_llm_calls", 5),
-            ]
-            
-            bars = ax.bar(systems, llm_calls, color=colors)
-            ax.set_ylabel("Average LLM Calls")
-            ax.set_title("Average LLM Calls per Query")
-            
-            for bar, calls in zip(bars, llm_calls):
-                ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.2,
-                       f'{calls:.1f}', ha='center', va='bottom')
-            
-            plt.tight_layout()
-            plt.savefig(figures_dir / "llm_calls_comparison.png", dpi=150)
-            plt.close()
-            
-            # Graph 3: Debate trigger rate
-            fig, ax = plt.subplots(figsize=(10, 6))
-            debate_rates = [
-                0,
-                100,
-                metrics["proposed_mad"].get("debate_trigger_rate", 0) * 100,
-            ]
-            
-            bars = ax.bar(systems, debate_rates, color=colors)
-            ax.set_ylabel("Debate Trigger Rate (%)")
-            ax.set_title("Debate Trigger Rate by System")
-            ax.set_ylim(0, 110)
-            
-            for bar, rate in zip(bars, debate_rates):
-                ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1,
-                       f'{rate:.1f}%', ha='center', va='bottom')
-            
-            plt.tight_layout()
-            plt.savefig(figures_dir / "debate_trigger_rate.png", dpi=150)
-            plt.close()
-            
-            # Graph 4: Conflict type distribution
-            fig, ax = plt.subplots(figsize=(10, 6))
-            conflict_dist = metrics["proposed_mad"].get("conflict_type_distribution", {})
-            
-            if conflict_dist:
+            logger.info(f"Saved figure: {figures_dir / filename}")
+
+        # ── Figure 1: Key-fact accuracy ───────────────────────────────
+        _bar_chart(
+            metric_key="key_fact_accuracy",
+            ylabel="Key-Fact Accuracy (%)",
+            title="Key-Fact Accuracy by System",
+            filename="key_fact_accuracy.png",
+            scale=100.0,
+            ylim_top=105.0,
+        )
+
+        # ── Figure 2: Debate trigger rate (measured, never hardcoded) ─
+        _bar_chart(
+            metric_key="debate_trigger_rate",
+            ylabel="Debate Trigger Rate (%)",
+            title="Debate Trigger Rate by System",
+            filename="debate_trigger_rate.png",
+            scale=100.0,
+            ylim_top=110.0,
+        )
+
+        # ── Figure 3: Average LLM calls (ok only) ────────────────────
+        _bar_chart(
+            metric_key="avg_llm_calls_ok",
+            ylabel="Avg. LLM Calls (OK)",
+            title="Average Successful LLM Calls per Query",
+            filename="llm_calls_ok.png",
+        )
+
+        # ── Figure 4: Latency p50 ─────────────────────────────────────
+        _bar_chart(
+            metric_key="latency_p50",
+            ylabel="Latency p50 (seconds)",
+            title="Median Latency per Query (p50)",
+            filename="latency_p50.png",
+        )
+
+        # ── Figure 5: Conflict type distribution (proposed_mad only) ──
+        conflict_dist = metrics.get("proposed_mad", {}).get("conflict_type_distribution", {})
+        if conflict_dist:
+            try:
                 types = list(conflict_dist.keys())
                 counts = list(conflict_dist.values())
                 colors_pie = plt.cm.Set3(np.linspace(0, 1, len(types)))
-                
-                wedges, texts, autotexts = ax.pie(
+                fig, ax = plt.subplots(figsize=(7, 7))
+                ax.pie(
                     counts, labels=types, colors=colors_pie,
-                    autopct='%1.1f%%', startangle=90
+                    autopct="%1.1f%%", startangle=90,
                 )
                 ax.set_title("Conflict Type Distribution (Proposed MAD)")
-            
-            plt.tight_layout()
-            plt.savefig(figures_dir / "conflict_distribution.png", dpi=150)
-            plt.close()
-            
-            logger.info(f"Graphs saved to {figures_dir}")
-            
-        except ImportError as e:
-            logger.warning(f"Could not generate graphs (missing dependency): {e}")
-        except Exception as e:
-            logger.error(f"Graph generation failed: {e}")
+                plt.tight_layout()
+                plt.savefig(figures_dir / "conflict_distribution.png", dpi=150)
+                plt.close()
+                logger.info(f"Saved figure: {figures_dir / 'conflict_distribution.png'}")
+            except Exception as e:
+                logger.warning(f"Conflict distribution chart failed: {e}")
+
+        # ── Figure 6: Error / retrieval failure rate ──────────────────
+        _bar_chart(
+            metric_key="error_rate",
+            ylabel="Error Rate (%)",
+            title="Error Rate by System",
+            filename="error_rates.png",
+            scale=100.0,
+            ylim_top=105.0,
+        )
 
 
-async def run_all_experiments(demo_mode: bool = False) -> Dict[str, Any]:
-    """Convenience function to run all experiments."""
-    runner = ExperimentRunner(demo_mode=demo_mode)
-    return await runner.run_all_experiments()
+# ------------------------------------------------------------------ #
+# Convenience entry points                                             #
+# ------------------------------------------------------------------ #
+
+def run_all_experiments(demo_mode: bool = False) -> Dict[str, Any]:
+    """Synchronous convenience wrapper (replaces old async version)."""
+    run_mode = RunMode.FIXTURE if demo_mode else RunMode.LIVE
+    runner = ExperimentRunner(run_mode=run_mode)
+    return runner.run_all_experiments()
 
 
 if __name__ == "__main__":
     import sys
     demo_mode = "--demo" in sys.argv
-    asyncio.run(run_all_experiments(demo_mode=demo_mode))
+    run_all_experiments(demo_mode=demo_mode)
