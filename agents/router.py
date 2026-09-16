@@ -1,145 +1,117 @@
 """
-Query router for determining which agents/tools to use.
+Query router for determining which agents to use for a given query.
+Uses ThreadPoolExecutor for parallel synchronous retrieval (no asyncio).
 """
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Any, Optional
 from enum import Enum
 from pydantic import BaseModel
 from loguru import logger
 
 from agents.base_agent import BaseAgent, registry
-from agents.search_agent import SearchAgentA, SearchAgentB, SearchAgentC
+from agents.search_agent import WebAgent, ReferenceAgent, ScholarlyAgent
 from config import settings
 
 
-class ToolType(str, Enum):
-    """Types of tools available."""
-    WEB_SEARCH = "web_search"
-    RAG = "rag"
-    CALCULATOR = "calculator"
-    DATABASE = "database"
+# Scholarly query keywords — only these queries get the Crossref agent
+SCHOLARLY_KEYWORDS = {
+    "study", "trial", "meta-analysis", "meta analysis", "systematic review",
+    "randomized", "randomised", "clinical", "cohort", "evidence for",
+    "research on", "doi", "journal", "peer reviewed", "peer-reviewed",
+    "pubmed", "arxiv", "preprint",
+}
 
 
 class RoutingDecision(BaseModel):
     """Result of routing a query."""
-    tools: List[ToolType] = [ToolType.WEB_SEARCH]
-    agents: List[str] = []  # agent IDs
+    agents: List[str] = []  # agent IDs selected
     reasoning: str = ""
-    confidence: float = 1.0
+
+
+def _is_scholarly(query: str) -> bool:
+    """Return True if the query warrants the Crossref scholarly agent."""
+    q = query.lower()
+    return any(kw in q for kw in SCHOLARLY_KEYWORDS)
 
 
 class QueryRouter:
     """
-    Routes queries to appropriate agents/tools.
-    
-    Currently supports web_search. Designed to be extensible for:
-    - RAG (retrieval-augmented generation)
-    - Calculator
-    - Database queries
-    - Code execution
-    - etc.
+    Routes queries to appropriate agents and executes them in parallel.
+
+    Three fixed agent profiles:
+    - WEB       (DuckDuckGo)   — always included
+    - REFERENCE (Wikipedia)    — always included
+    - SCHOLARLY (Crossref)     — only for research-flavoured queries
     """
-    
+
     def __init__(self):
         self._initialized = False
-        self._mode: Optional[bool] = None
-    
-    def initialize(self, demo_mode: Optional[bool] = None) -> None:
-        """Initialize default agents."""
-        mode = (self._mode if demo_mode is None and self._initialized else (settings.demo_mode if demo_mode is None else demo_mode))
-        if self._initialized and self._mode == mode:
+
+    def initialize(self) -> None:
+        """Register the three agents (idempotent)."""
+        if self._initialized:
             return
-        if self._initialized and self._mode != mode:
-            registry.clear()
-        
-        # Register default search agents
-        registry.register(SearchAgentA(demo_mode=mode))
-        registry.register(SearchAgentB(demo_mode=mode))
-        
-        # Register third agent if not in demo mode (to save resources)
-        if not mode:
-            registry.register(SearchAgentC(demo_mode=mode))
-        
+        registry.clear()
+        registry.register(WebAgent())
+        registry.register(ReferenceAgent())
+        registry.register(ScholarlyAgent())
         self._initialized = True
-        self._mode = mode
         logger.info(f"Router initialized with agents: {registry.list_ids()}")
-    
+
     def route(self, query: str) -> RoutingDecision:
-        """
-        Determine which tools and agents to use for a query.
-        
-        Args:
-            query: User query
-            
-        Returns:
-            RoutingDecision with selected tools and agents
-        """
+        """Determine which agents to use for a query."""
         self.initialize()
-        
-        # Simple routing logic - can be enhanced with LLM-based routing
-        query_lower = query.lower()
-        
-        # Default to web search for all queries
-        tools = [ToolType.WEB_SEARCH]
-        agents = registry.list_ids()
-        reasoning = "Default routing to web search agents"
-        confidence = 0.9
-        
-        # Could add more sophisticated routing here:
-        # - Detect math queries -> calculator
-        # - Detect code queries -> code execution
-        # - Detect factual queries -> web search + RAG
-        # - etc.
-        
-        return RoutingDecision(
-            tools=tools,
-            agents=agents,
-            reasoning=reasoning,
-            confidence=confidence,
-        )
-    
-    async def execute(self, query: str) -> Dict[str, Any]:
+
+        if _is_scholarly(query):
+            agents = registry.list_ids()   # all three
+            reasoning = "Scholarly query — routing to WEB + REFERENCE + SCHOLARLY agents"
+        else:
+            # Exclude scholarly for general queries
+            agents = [aid for aid in registry.list_ids() if aid != "scholarly_agent"]
+            reasoning = "General query — routing to WEB + REFERENCE agents"
+
+        return RoutingDecision(agents=agents, reasoning=reasoning)
+
+    def execute(self, query: str) -> Dict[str, Any]:
         """
-        Execute the routing decision.
-        
+        Execute the routing decision synchronously with a ThreadPoolExecutor.
+
         Args:
-            query: User query
-            
+            query: User query (passed verbatim to every agent)
+
         Returns:
-            Dictionary with routing decision and agent results
+            Dictionary with decision and per-agent results
         """
         decision = self.route(query)
-        
-        # Get selected agents
-        agents = [registry.get(aid) for aid in decision.agents if registry.get(aid)]
-        
+        agents: List[BaseAgent] = [
+            registry.get(aid) for aid in decision.agents if registry.get(aid)
+        ]
+
         if not agents:
             return {
                 "decision": decision.model_dump(),
                 "evidence": [],
                 "error": "No agents available",
             }
-        
-        # Retrieve evidence from all selected agents in parallel
-        import asyncio
-        tasks = [agent.retrieve(query) for agent in agents]
-        evidence_list = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Process results
+
         results = []
-        for i, result in enumerate(evidence_list):
-            agent = agents[i]
-            if isinstance(result, Exception):
-                logger.error(f"Agent {agent.agent_id} failed: {result}")
-                results.append({
-                    "agent_id": agent.agent_id,
-                    "error": str(result),
-                })
-            else:
-                results.append({
-                    "agent_id": agent.agent_id,
-                    "evidence": result.model_dump(),
-                })
-        
+        with ThreadPoolExecutor(max_workers=len(agents)) as pool:
+            futures = {pool.submit(agent.retrieve, query): agent for agent in agents}
+            for fut in as_completed(futures):
+                agent = futures[fut]
+                try:
+                    evidence = fut.result()
+                    results.append({
+                        "agent_id": agent.agent_id,
+                        "evidence": evidence.model_dump(),
+                    })
+                except Exception as exc:
+                    logger.error(f"Agent {agent.agent_id} failed: {exc}")
+                    results.append({
+                        "agent_id": agent.agent_id,
+                        "error": repr(exc),
+                    })
+
         return {
             "decision": decision.model_dump(),
             "evidence": results,
